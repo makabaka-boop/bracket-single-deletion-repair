@@ -25,7 +25,7 @@ locked 标记。只允许修改未锁定位置的字符，使整串成为类型�
 
 from __future__ import annotations
 
-from typing import Optional, Sequence, Tuple
+from typing import List, NamedTuple, Optional, Sequence, Tuple
 
 OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
 PAIRS = (("(", ")"), ("[", "]"), ("{", "}"))
@@ -93,3 +93,150 @@ def repair(chars: Sequence[str], locked: Sequence[bool]) -> Optional[Tuple[str, 
     pairs.sort()
 
     return result, pairs
+
+
+class SingleDeletionResult(NamedTuple):
+    """单个赘余标记修复结果，所有坐标均为原稿零基下标。"""
+
+    text: str
+    pairs: List[List[int]]
+    # (index, before, after)，只包含替换，不包含删除。
+    changes: List[Tuple[int, str, str]]
+    deleted_index: Optional[int]
+
+
+class _DeletionState(NamedTuple):
+    cost: int
+    text: str
+    # 修复串中每个字符对应的原稿位置；删除位置不会出现在这里。
+    positions: Tuple[int, ...]
+    deleted_index: Optional[int]
+
+
+def repair_single_deletion(
+    chars: Sequence[str], locked: Sequence[bool]
+) -> Optional[SingleDeletionResult]:
+    """至多删除一个未锁定位置，其余未锁定位置可替换。
+
+    奇数长度必须恰好删除一个位置；偶数长度删除一个后会成为奇数，不可能合法，
+    因此不使用删除，结果应与 ``repair`` 一致。
+
+    状态 ``dp[used][i][j]`` 表示原稿区间 [i, j) 在是否已用掉删除次数
+    （``used`` 为 0/1）后修复成合法串的最优状态。状态始终携带原稿坐标和
+    deleted_index，而不是先删掉字符再对缩短后的数组重新编号。
+    """
+    n = len(chars)
+    if not 3 <= n <= 81:
+        raise ValueError("single-deletion repair requires 3..81 tokens")
+
+    need_delete = n % 2
+    dp: List[List[List[Optional[_DeletionState]]]] = [
+        [[None] * (n + 1) for _ in range(n + 1)] for _ in range(2)
+    ]
+    for i in range(n + 1):
+        dp[0][i][i] = _DeletionState(0, "", (), None)
+
+    def better(current: Optional[_DeletionState], candidate: _DeletionState) -> bool:
+        return (
+            current is None
+            or candidate.cost < current.cost
+            or (
+                candidate.cost == current.cost
+                and (candidate.text, candidate.deleted_index)
+                < (current.text, current.deleted_index)
+            )
+        )
+
+    for length in range(1, n + 1):
+        for i in range(n + 1 - length):
+            j = i + length
+
+            for used in (0, 1):
+                # 合法括号串长度必须为偶数：length - used 为保留字符数。
+                if length < used or (length - used) % 2 != 0:
+                    continue
+
+                best: Optional[_DeletionState] = None
+
+                # 直接删除区间首个原稿位置。删除权使用后，其余部分不能再删。
+                if used == 1 and not locked[i]:
+                    child = dp[0][i + 1][j]
+                    if child is not None:
+                        candidate = _DeletionState(
+                            child.cost + 1,
+                            child.text,
+                            child.positions,
+                            i,
+                        )
+                        if better(best, candidate):
+                            best = candidate
+
+                # 保留原稿位置 i 作为开括号，并枚举它在原稿中的闭括号 k。
+                for k in range(i + 1, j):
+                    if used == 0:
+                        child_pairs = (
+                            (dp[0][i + 1][k], dp[0][k + 1][j]),
+                        )
+                    else:
+                        child_pairs = (
+                            (dp[1][i + 1][k], dp[0][k + 1][j]),
+                            (dp[0][i + 1][k], dp[1][k + 1][j]),
+                        )
+
+                    for inner, tail in child_pairs:
+                        if inner is None or tail is None:
+                            continue
+
+                        base_cost = inner.cost + tail.cost
+                        deleted_index = (
+                            inner.deleted_index
+                            if inner.deleted_index is not None
+                            else tail.deleted_index
+                        )
+                        for oc, cc in PAIRS:
+                            if locked[i] and chars[i] != oc:
+                                continue
+                            if locked[k] and chars[k] != cc:
+                                continue
+
+                            candidate = _DeletionState(
+                                base_cost
+                                + (chars[i] != oc)
+                                + (chars[k] != cc),
+                                oc + inner.text + cc + tail.text,
+                                (i,) + inner.positions + (k,) + tail.positions,
+                                deleted_index,
+                            )
+                            if better(best, candidate):
+                                best = candidate
+
+                dp[used][i][j] = best
+
+    state = dp[need_delete][0][n]
+    if state is None:
+        return None
+
+    pairs: List[List[int]] = []
+    stack: List[int] = []
+    for output_index, original_index in enumerate(state.positions):
+        ch = state.text[output_index]
+        if ch in OPEN_TO_CLOSE:
+            stack.append(original_index)
+        else:
+            pairs.append([stack.pop(), original_index])
+    pairs.sort()
+
+    changes: List[Tuple[int, str, str]] = []
+    for output_index, original_index in enumerate(state.positions):
+        before = chars[original_index]
+        after = state.text[output_index]
+        if before != after:
+            changes.append((original_index, before, after))
+    changes.sort()
+
+    return SingleDeletionResult(
+        state.text,
+        pairs,
+        changes,
+        state.deleted_index,
+    )
