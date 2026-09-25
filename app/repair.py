@@ -21,6 +21,12 @@ locked 标记。只允许修改未锁定位置的字符，使整串成为类型�
 
 复杂度：状态 O(n^2)，每状态转移 O(n)，总 O(n^3)。n=160 时约 8.7 万个
 候选串拼接，毫秒级完成。
+
+单个赘余标记变体（repair_redundant）：装配宏偶尔多抄一个未确认标记，
+额外允许删除至多一个未锁定位置，删除与替换各计一次修改。状态增加
+一维 d ∈ {0, 1} 表示区间内是否已删除，被删位置的原稿下标随状态
+携带，因此配对与改动清单都能回指原稿坐标，而不必事后猜测删了哪一位。
+并列时先取修复串字典序最小，再取被删下标最小。
 """
 
 from __future__ import annotations
@@ -93,3 +99,87 @@ def repair(chars: Sequence[str], locked: Sequence[bool]) -> Optional[Tuple[str, 
     pairs.sort()
 
     return result, pairs
+
+
+def repair_redundant(
+    chars: Sequence[str], locked: Sequence[bool]
+) -> Optional[Tuple[str, list, Optional[int]]]:
+    """单个赘余标记修复：允许删除至多一个未锁定位置。
+
+    删除与替换各计一次修改。奇数长度必须删除恰好一个位置；偶数长度
+    删除一个位置后为奇数，不可能合法，因此结果与 repair() 完全一致。
+
+    返回 (修复串, 配对下标, 被删下标或 None)；配对与删除下标一律为
+    原稿零基坐标。并列时先取修复串字典序最小，再取被删下标最小。
+    无解返回 None。
+    """
+    n = len(chars)
+    if n == 0:
+        return "", [], None
+
+    # dp[d][i][j]：把区间 [i, j) 修复为合法串且区间内恰好删除 d 个位置
+    # 的最优解 (cost, text, deleted)，不可达为 None。deleted 为被删位置
+    # 的原稿下标（d=0 时为 -1）。是否已删除直接编码在状态里，原稿下标
+    # 从不丢失。只有 d 与区间长度同奇偶的状态可达。
+    dp = [[[None] * (n + 1) for _ in range(n + 1)] for _ in range(2)]
+    for i in range(n + 1):
+        dp[0][i][i] = (0, "", -1)
+
+    for length in range(1, n + 1):
+        d = length % 2
+        for i in range(n + 1 - length):
+            j = i + length
+            best = None
+            # 配对转移：位置 i 与 k 配成一对，删除（若 d=1）落在某一侧
+            for k in range(i + 1, j):
+                for dl in ((0, 1) if d else (0,)):
+                    left = dp[dl][i + 1][k]
+                    right = dp[d - dl][k + 1][j]
+                    if left is None or right is None:
+                        continue
+                    base = left[0] + right[0]
+                    inner, tail = left[1], right[1]
+                    deleted = left[2] if dl else right[2]
+                    for oc, cc in PAIRS:
+                        if locked[i] and chars[i] != oc:
+                            continue
+                        if locked[k] and chars[k] != cc:
+                            continue
+                        cost = base + (chars[i] != oc) + (chars[k] != cc)
+                        cand = (cost, oc + inner + cc + tail, deleted)
+                        if best is None or cand < best:
+                            best = cand
+            if d:
+                # 删除转移：直接删掉未锁定的 m（计 1 次），两侧各自平衡
+                for m in range(i, j, 2):
+                    if locked[m]:
+                        continue
+                    left = dp[0][i][m]
+                    right = dp[0][m + 1][j]
+                    if left is None or right is None:
+                        continue
+                    cand = (1 + left[0] + right[0], left[1] + right[1], m)
+                    if best is None or cand < best:
+                        best = cand
+            dp[d][i][j] = best
+
+    root = dp[n % 2][0][n]
+    if root is None:
+        return None
+    _, text, deleted = root
+
+    def to_orig(p: int) -> int:
+        # 修复串坐标 -> 原稿坐标：跳过被删位置（单调映射，保序）
+        return p + 1 if deleted >= 0 and p >= deleted else p
+
+    # 依据修复结果重建配对下标（栈式扫描），再映射回原稿坐标
+    pairs = []
+    stack: list[int] = []
+    for idx, ch in enumerate(text):
+        if ch in OPEN_TO_CLOSE:
+            stack.append(idx)
+        else:
+            pairs.append([to_orig(stack.pop()), to_orig(idx)])
+    pairs.sort()
+
+    return text, pairs, (deleted if deleted >= 0 else None)
